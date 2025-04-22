@@ -31,23 +31,20 @@ import select
 import signal
 import requests
 import threading
+import logging
+
+log = logging.getLogger(__name__)
+
 
 CAMERA_WAIT_TIMEOUT = 10
 DEFAULT_URL = 'https://connect.prusa3d.com/c/snapshot'
-
-verbose = False
-
-
-def verbose_print(*args, **kwargs):
-    if verbose:
-        print(*args, **kwargs)
 
 
 def load_config(config_file = None):
     if config_file is None:
         path = os.path.dirname(os.path.realpath(__file__))
         config_file = os.path.join(path, 'config.toml')
-    verbose_print("Loading '{}'...".format(config_file))
+    log.debug("Loading config file '%s'", config_file)
     config = toml.load(config_file)
     if not 'camera' in config or len(config['camera']) < 1:
         if 'cameras' in config and len(config['cameras']) >= 1:
@@ -85,7 +82,7 @@ def init(config = {}, vd = None):
                         config['name']))
         vd = open(dev, 'rb+', buffering=0)
 
-    verbose_print("Initializing '{}' ({})".format(config['name'], vd.name))
+    log.debug("Initializing '%s' (%s)", config['name'], vd.name)
     # Check video capture capability
     cp = v4l2.v4l2_capability()
     fcntl.ioctl(vd, v4l2.VIDIOC_QUERYCAP, cp)
@@ -125,14 +122,12 @@ def init(config = {}, vd = None):
                     break
         size.index += 1
     if config_res is not None and not config_res_found:
-        print("Warning: Resolution '{}' not supported by '{}', " \
-                "using max instead".format(
+        log.warning("Resolution '%s' not supported by '%s', using max instead",
                     config_res,
-                    config['name']),
-                file=sys.stderr)
-    verbose_print("Setting resolution {}x{}".format(
+                    config['name'])
+    log.debug("Setting resolution %sx%s",
             fmt.fmt.pix.width,
-            fmt.fmt.pix.height))
+            fmt.fmt.pix.height)
     fcntl.ioctl(vd, v4l2.VIDIOC_S_FMT, fmt)
 
     # Request and set up capture buffer
@@ -173,7 +168,7 @@ def capture(vd, buf, mm, config):
         raise TimeoutError("Timeout getting frame for '{}'".format(
                     config['name']))
     fcntl.ioctl(vd, v4l2.VIDIOC_DQBUF, buf)
-    verbose_print("Captured frame for '{}'".format(config['name']))
+    log.debug("Captured frame for '%s'", config['name'])
     # At this point, the `mm` mmap contains the frame data
 
 
@@ -211,7 +206,7 @@ def upload(buf, mm, config):
     )
     mm.seek(0)
     response.raise_for_status()
-    verbose_print("Updated frame for '{}'".format(config['name']))
+    log.debug("Updated frame for '%s'", config['name'])
 
 
 stop = threading.Event()
@@ -223,11 +218,7 @@ def capture_thread(vd, buf, mm, config, rate = 30):
                     vd, buf, mm = init(config)
                 capture(vd, buf, mm, config)
             except Exception as err:
-                print("Error capturing frame for '{}': {}".format(
-                            config['name'],
-                            err
-                        ),
-                        file=sys.stderr)
+                log.exception("Error capturing frame for '%s'", config['name']),
                 if vd is not None:
                     vd.close()
                     vd = None
@@ -240,11 +231,8 @@ def capture_thread(vd, buf, mm, config, rate = 30):
                 try:
                     upload(buf, mm, config)
                 except Exception as err:
-                    print("Error updating frame for '{}': {}".format(
-                                config['name'],
-                                err
-                            ),
-                            file=sys.stderr)
+                    log.exception("Error updating frame for '{}'", config['name'])
+                    raise
     finally:
         if vd is not None:
             vd.close()
@@ -253,15 +241,14 @@ def capture_thread(vd, buf, mm, config, rate = 30):
 
 
 def _signal_handler(sig, frame):
-    verbose_print('Exiting...')
+    log.debug('Exiting...')
     stop.set()
 
 
-def _init_error(fatal, msg):
+def _init_error(fatal, msg, *args):
+    log.exception(msg, *args)
     if fatal:
-        raise RuntimeError(msg)
-    else:
-        print("Warning: {}".format(msg), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
@@ -282,7 +269,9 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    verbose = args.verbose
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        stream=sys.stderr, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+
     config = load_config(args.config)
     rate = config['refresh_rate']
     threads = []
@@ -304,8 +293,8 @@ if __name__ == '__main__':
         try:
             vd, buf, mm = init(cam_config)
         except Exception as e:
-            _init_error(args.oneshot, "Failed to initialize '{}'".format(
-                    cam_config['name']))
+            _init_error(args.oneshot, "Failed to initialize '%s'",
+                        cam_config['name'])
 
         if vd is not None:
             try:
@@ -313,21 +302,15 @@ if __name__ == '__main__':
                 if args.oneshot:
                     vd.close()
             except Exception as e:
-                _init_error(args.oneshot, "Error capturing frame for '{}': " \
-                        "{}".format(
-                            config['name'],
-                            err
-                        ))
+                _init_error(args.oneshot, "Error capturing frame for '%s'",
+                            config['name'])
             try:
                 upload(buf, mm, cam_config)
                 if args.oneshot:
                     mm.close()
             except Exception as e:
-                _init_error(args.oneshot, "Error updating frame for '{}': " \
-                        "{}".format(
-                            config['name'],
-                            err
-                        ))
+                _init_error(args.oneshot, "Error updating frame for '%s'",
+                            config['name'])
 
         if not args.oneshot:
             threads.append(threading.Thread(
